@@ -1,0 +1,848 @@
+import { useEffect, useRef, useState } from "react"
+import { Camera, Check, CircleHelp, Copy, Eraser, ExternalLink, FolderOpen, KeyRound, ListChecks, MessageSquareQuote, MessageSquareReply, Mic, PanelLeft, RefreshCw, SendHorizontal, Volume2, X } from "lucide-react"
+import {
+  ANSWER_LENGTHS,
+  AUDIO_SOURCE_LABELS,
+  AUTO_ANSWER_LABELS,
+  LANGUAGES,
+  OWN_KEY_PRESETS,
+  QUICK_ACTIONS,
+  segmentLabel,
+  suggestionsVisible,
+  type AnswerLength,
+  type AudioSource,
+  type AutoAnswerMode,
+  type ChatChunk,
+  type ChatMessage,
+  type LanguageCode,
+  type OwnKeyView,
+  type PanelTab,
+  type PlanState,
+  type QuickActionId,
+  type SettingsView,
+  type SuggestionsState
+} from "@shared/types"
+import { t } from "@shared/i18n"
+import { api, shortcutLabel } from "@/lib/api"
+import { useAudioCapture, useLiveTranscript, type Interim, type TranscriptLine } from "@/lib/capture"
+import { useEvent, usePlanState, useSessionState, useSettings, useSuggestions } from "@/lib/hooks"
+import { listAudioInputs, type AudioInputDevice, type AudioLevels } from "@/lib/audio"
+import { cn, copyText } from "@/lib/utils"
+import { markdownToPlain } from "@/lib/plain-text"
+import { Button } from "@/components/ui/button"
+import { Select, Toggle } from "@/components/ui/fields"
+import { Markdown } from "@/components/Markdown"
+
+/**
+ * The panel attached under the toolbar: answers, the live transcript and settings as tabs, with
+ * suggested questions on the left while listening. It also owns audio capture, which keeps
+ * running on every tab and while hidden.
+ */
+export function PanelWindow() {
+  const session = useSessionState()
+  const [settings, update] = useSettings()
+  const [tab, setTab] = useState<PanelTab>("answers")
+  const capture = useAudioCapture(session)
+  const transcript = useLiveTranscript(session)
+  const suggestions = useSuggestions()
+  const plan = usePlanState()
+
+  useEffect(() => {
+    void api.invoke("windows:state").then((s) => setTab(s.panelTab))
+  }, [])
+  useEvent("panel:tab", setTab)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") void api.invoke("windows:hide", "chat")
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [])
+
+  const choose = (next: PanelTab) => {
+    setTab(next)
+    void api.invoke("panel:set-tab", next)
+  }
+  // Hands-free answering is available whenever the user has configured a provider.
+  const autoAllowed = Boolean(settings?.ownKey)
+  const handsFree = autoAllowed && settings ? settings.autoAnswer !== "off" : false
+  const rail = suggestionsVisible(settings, session.status)
+  const dragToolbar = useDragToolbar()
+
+  return (
+    <div className="flex h-screen w-full flex-col p-1">
+      <div className="glass flex h-full w-full flex-col overflow-hidden">
+        <header {...dragToolbar} className="flex h-9 shrink-0 cursor-grab select-none items-center gap-1 border-b border-white/10 pl-1 pr-1">
+          <div className="no-drag flex items-center rounded-md bg-white/[0.04] p-0.5">
+            <TabButton active={tab === "answers"} onClick={() => choose("answers")}>{t("Answers")}</TabButton>
+            <TabButton active={tab === "transcript"} onClick={() => choose("transcript")}>
+              {t("Transcript")}
+              {session.status === "recording" && <span className="ml-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
+            </TabButton>
+            <TabButton active={tab === "settings"} onClick={() => choose("settings")}>{t("Settings")}</TabButton>
+          </div>
+          <div className="no-drag ml-auto flex items-center gap-0.5">
+            {session.status !== "idle" && settings && (
+              <Button
+                variant={rail ? "secondary" : "ghost"}
+                size="icon-sm"
+                className="h-7 w-7"
+                onClick={() => void update({ suggestions: !settings.suggestions })}
+                title={rail ? t("Hide suggested questions") : t("Show suggested questions")}
+              >
+                <PanelLeft className="h-3.5 w-3.5" />
+              </Button>
+            )}
+            {tab === "answers" && !autoAllowed ? (
+              <button
+                type="button"
+                onClick={() => void api.invoke("panel:show", "answers")}
+                title={t("Configure an API provider to enable automatic answers.")}
+                className="h-6 rounded-full px-2 text-[11px] font-medium text-white/55 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                {t("Auto-answer")} <span className="ml-0.5 rounded bg-cyan-500/20 px-1 text-[10px] text-cyan-200">API</span>
+              </button>
+            ) : tab === "answers" ? (
+              <button
+                type="button"
+                onClick={() => update({ autoAnswer: handsFree ? "off" : "questions" })}
+                title={handsFree ? t("Questions heard in the meeting are answered automatically. Click to turn off.") : t("Click to answer questions from the meeting automatically.")}
+                className={cn(
+                  "h-6 rounded-full px-2 text-[11px] font-medium transition-colors",
+                  handsFree ? "bg-sky-500/80 text-white hover:bg-sky-400/80" : "text-white/55 hover:bg-white/10 hover:text-white"
+                )}
+              >
+                {handsFree ? t("Auto-answer on") : t("Auto-answer off")}
+              </button>
+            ) : tab === "transcript" ? (
+              <Levels levels={capture.levels} />
+            ) : null}
+            <Button variant="ghost" size="icon-sm" className="h-7 w-7" onClick={() => api.invoke("windows:hide", "chat")} title={t("Close (Esc)")}>
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </header>
+        {settings && settings.shortcutConflicts.length > 0 && (
+          <div className="flex items-center gap-2 border-b border-amber-400/20 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200">
+            <span className="min-w-0 flex-1 truncate">
+              {t("Another app already uses {keys}. Pick other keys on the web dashboard.", { keys: settings.shortcutConflicts.map((a) => shortcutLabel(settings.shortcuts[a])).join(", ") })}
+            </span>
+            <button type="button" className="no-drag shrink-0 font-medium text-amber-100 hover:text-white" onClick={() => void api.invoke("cloud:open-web")}>
+              {t("Open")}
+            </button>
+          </div>
+        )}
+        <div className="flex min-h-0 flex-1">
+          {rail && <Suggestions state={suggestions} plan={plan} onOff={() => void update({ suggestions: false })} />}
+          <div className="flex min-w-0 flex-1 flex-col">
+            {/* Both tabs stay mounted: a reply keeps streaming and scroll positions survive tab switches. */}
+            <div className={cn("min-h-0 flex-1 flex-col", tab === "answers" ? "flex" : "hidden")}>
+              <Answers listening={session.status !== "idle"} handsFree={handsFree} autoAllowed={autoAllowed} plan={plan} />
+            </div>
+            <div className={cn("min-h-0 flex-1 flex-col", tab === "transcript" ? "flex" : "hidden")}>
+              <Transcript
+                status={session.status}
+                connected={session.connected}
+                source={session.audioSource}
+                notice={capture.error ?? session.notice ?? capture.warnings[0] ?? null}
+                lines={transcript.lines}
+                interim={transcript.interim}
+                onSource={(s) => void update({ audioSource: s })}
+                deviceId={settings?.audioDeviceId ?? ""}
+                onDevice={(id) => void update({ audioDeviceId: id })}
+                suggestions={settings?.suggestions ?? false}
+                onSuggestions={(on) => void update({ suggestions: on })}
+              />
+            </div>
+            {tab === "settings" && settings && <SettingsTab settings={settings} update={update} plan={plan} autoAllowed={autoAllowed} />}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The panel hangs under the toolbar and can't be moved on its own: dragging the header's empty space moves the
+ * toolbar, and the panel follows. One move per animation frame; offsets are from where the pointer went down.
+ */
+function useDragToolbar() {
+  const drag = useRef<{ x: number; y: number; dx: number; dy: number; frame: number } | null>(null)
+  const end = (e: React.PointerEvent<HTMLElement>) => {
+    const d = drag.current
+    if (!d) return
+    cancelAnimationFrame(d.frame)
+    drag.current = null
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId)
+    void api.invoke("windows:drag", { phase: "move", dx: d.dx, dy: d.dy }).then(() => api.invoke("windows:drag", { phase: "end", dx: 0, dy: 0 }))
+  }
+  return {
+    onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
+      if (e.button !== 0 || (e.target as HTMLElement).closest("button, select, input, a, label")) return
+      e.currentTarget.setPointerCapture(e.pointerId)
+      drag.current = { x: e.screenX, y: e.screenY, dx: 0, dy: 0, frame: 0 }
+      void api.invoke("windows:drag", { phase: "start", dx: 0, dy: 0 })
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLElement>) => {
+      const d = drag.current
+      if (!d) return
+      d.dx = e.screenX - d.x
+      d.dy = e.screenY - d.y
+      if (d.frame) return
+      d.frame = requestAnimationFrame(() => {
+        d.frame = 0
+        if (drag.current === d) void api.invoke("windows:drag", { phase: "move", dx: d.dx, dy: d.dy })
+      })
+    },
+    onPointerUp: end,
+    onPointerCancel: end
+  }
+}
+
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex h-6 items-center rounded px-2.5 text-[12px] font-medium transition-colors",
+        active ? "bg-white/[0.12] text-white shadow-sm" : "text-white/50 hover:text-white/80"
+      )}
+    >
+      {children}
+    </button>
+  )
+}
+
+const ACTION_ICONS: Record<QuickActionId, React.ReactNode> = {
+  say: <MessageSquareQuote className="h-3 w-3" />,
+  ask: <CircleHelp className="h-3 w-3" />,
+  recap: <ListChecks className="h-3 w-3" />
+}
+
+/** Questions drawn from the conversation, then fixed quick actions; a click answers in the Answers tab. */
+function Suggestions({ state, plan, onOff }: { state: SuggestionsState; plan: PlanState; onOff: () => void }) {
+  const [busy, setBusy] = useState(false)
+  useEvent("chat:busy", setBusy)
+  const use = (id: string) => void api.invoke("suggestions:use", id).catch(() => {})
+
+  return (
+    <aside className="flex w-[200px] shrink-0 flex-col border-r border-white/10 bg-white/[0.02]">
+      <div className="flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1">
+        <span className="flex-1 text-[10.5px] font-medium uppercase tracking-wide text-white/35">{t("Suggested")}</span>
+        <span className="flex items-center px-1" title={t("Turn off suggested questions: nothing is sent to the AI for them.")}>
+          <Toggle size="sm" checked onChange={onOff} label={t("Suggested questions")} />
+        </span>
+        <button
+          type="button"
+          onClick={() => void api.invoke("suggestions:refresh").catch(() => {})}
+          disabled={state.updating}
+          title={t("Refresh from the conversation")}
+          className="rounded p-1 text-white/35 transition-colors hover:bg-white/10 hover:text-white/80 disabled:hover:bg-transparent"
+        >
+          <RefreshCw className={cn("h-3 w-3", state.updating && "animate-spin")} />
+        </button>
+      </div>
+      {state.topic && (
+        <p className="truncate px-2.5 pb-1 text-[11px] text-sky-200/55" title={state.topic}>
+          {state.topic}
+        </p>
+      )}
+      <div className="scroll min-h-0 flex-1 space-y-0.5 px-1 pb-1">
+        {state.items.length === 0 ? (
+          <p className="px-1.5 py-1 text-[11px] leading-snug text-white/35">
+            {plan.used && plan.limits && plan.used.listening >= plan.limits.listening
+              ? plan.plan === "unlimited"
+                ? t("Paused for today: the daily limit is used.")
+                : t("Paused for today: upgrade for more.")
+              : state.updating
+                ? t("Reading the conversation…")
+                : t("Questions show up here as the conversation goes.")}
+          </p>
+        ) : (
+          state.items.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              disabled={busy}
+              onClick={() => use(s.id)}
+              title={s.text}
+              className="line-clamp-3 w-full animate-fade-in rounded-md px-1.5 py-1 text-left text-[12px] leading-snug text-white/85 transition-colors hover:bg-white/[0.07] hover:text-white disabled:opacity-45"
+            >
+              {s.text}
+            </button>
+          ))
+        )}
+      </div>
+      <div className="space-y-px border-t border-white/10 p-1">
+        {QUICK_ACTIONS.map((a) => (
+          <button
+            key={a.id}
+            type="button"
+            disabled={busy}
+            onClick={() => use(a.id)}
+            className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-[11.5px] text-white/60 transition-colors hover:bg-white/[0.07] hover:text-white disabled:opacity-45"
+          >
+            <span className="text-white/40">{ACTION_ICONS[a.id]}</span>
+            {t(a.label)}
+          </button>
+        ))}
+      </div>
+    </aside>
+  )
+}
+
+function Answers({ listening, handsFree, autoAllowed, plan }: { listening: boolean; handsFree: boolean; autoAllowed: boolean; plan: PlanState }) {
+  const [history, setHistory] = useState<ChatMessage[]>([])
+  const [stream, setStream] = useState<ChatChunk | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [input, setInput] = useState("")
+  const [heard, setHeard] = useState<string | null>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    void api.invoke("chat:history").then(setHistory)
+    void api.invoke("session:last-utterance").then((u) => setHeard(u?.text ?? null))
+    inputRef.current?.focus()
+  }, [])
+  useEvent("chat:message", (m) => {
+    setHistory((h) => [...h, m])
+    setStream(null)
+  })
+  useEvent("chat:chunk", (c) => setStream((s) => (s && s.id === c.id ? { id: c.id, text: s.text + c.text } : c)))
+  useEvent("chat:busy", setBusy)
+  useEvent("chat:cleared", () => {
+    setHistory([])
+    setStream(null)
+  })
+  useEvent("session:utterance", (u) => setHeard(u.text))
+  useEvent("session:state", (s) => {
+    if (s.status === "idle") setHeard(null)
+  })
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
+  }, [history.length, stream?.text.length])
+
+  const send = (text: string) => {
+    if (!text.trim() || busy) return
+    setInput("")
+    void api.invoke("chat:send", text)
+    inputRef.current?.focus()
+  }
+
+  return (
+    <>
+      <div ref={listRef} className="scroll min-h-0 flex-1 space-y-1.5 px-2.5 py-2">
+        {history.length === 0 && !stream && (
+          <p className="px-4 py-6 text-center text-[11.5px] leading-relaxed text-white/45">
+            {handsFree
+              ? t("Ask anything, or press Listen: questions from the meeting are answered here.")
+              : autoAllowed
+                ? t("Ask anything. Auto-answer is off.")
+                : t("Ask anything, or press Listen and then Answer when a question is heard.")}
+          </p>
+        )}
+        {history.map((m) => <Message key={m.id} message={m} />)}
+        {stream && (
+          <div className={ANSWER}>
+            <Markdown text={stream.text} />
+            <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse bg-white/70 align-middle" />
+          </div>
+        )}
+        {busy && !stream && <p className="animate-pulse px-1 text-[11px] text-white/45">{t("Thinking…")}</p>}
+      </div>
+
+      {listening && heard && (
+        <div className="flex items-center gap-1.5 border-t border-white/10 px-2 py-1">
+          <span className="min-w-0 flex-1 truncate text-[11px] text-white/50" title={heard}>
+            <span className="mr-1 text-white/35">{t("Heard")}</span>
+            {heard}
+          </span>
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-[11px]" disabled={busy} onClick={() => void api.invoke("chat:answer-last")} title={t("Answer the last thing heard")}>
+            <MessageSquareReply className="h-3 w-3" /> {t("Answer")}
+          </Button>
+        </div>
+      )}
+
+      <PlanBar plan={plan} />
+
+      <form
+        className="flex items-center gap-1 border-t border-white/10 p-1.5"
+        onSubmit={(e) => {
+          e.preventDefault()
+          send(input)
+        }}
+      >
+        <Button type="button" variant="ghost" size="icon-sm" title={t("Analyze my screen")} disabled={busy} onClick={() => void api.invoke("chat:screenshot").catch(() => {})}>
+          <Camera className="h-3.5 w-3.5" />
+        </Button>
+        <input
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={busy}
+          placeholder={busy ? t("Waiting for reply…") : t("Type a message")}
+          className="h-7 min-w-0 flex-1 rounded-md border border-white/[0.12] bg-white/5 px-2.5 text-[13px] text-white placeholder:text-white/35 focus:border-white/35 focus:outline-none"
+        />
+        <Button type="button" variant="ghost" size="icon-sm" onClick={() => api.invoke("chat:clear")} title={t("Clear conversation")} disabled={history.length === 0}>
+          <Eraser className="h-3.5 w-3.5" />
+        </Button>
+        <Button type="submit" variant="primary" size="icon-sm" title={t("Send (Enter)")} disabled={busy || !input.trim()}>
+          <SendHorizontal className="h-3.5 w-3.5" />
+        </Button>
+      </form>
+    </>
+  )
+}
+
+/**
+ * The account line under the answers. Signed out: sign up or sign in happens in the browser, which links
+ * this computer (the code shown here must match the one on the page). Free and Pro: answers left today.
+ * Nothing on Unlimited. The own-key form opens from the tray menu ("Use your own API key…").
+ */
+function PlanBar({ plan: _plan }: { plan: PlanState }) {
+  const [settings] = useSettings()
+  const [ownKeyForm, setOwnKeyForm] = useState(false)
+  // Opened from the tray; the pending flag covers a panel that wasn't loaded yet when the tray asked.
+  useEffect(() => {
+    void api.invoke("ownkey:pending").then((pending) => pending && setOwnKeyForm(true))
+  }, [])
+  useEvent("ownkey:open", () => {
+    setOwnKeyForm(true)
+    void api.invoke("ownkey:pending")
+  })
+  if (ownKeyForm) return <OwnKeyForm current={settings?.ownKey ?? null} onClose={() => setOwnKeyForm(false)} />
+  if (settings?.ownKey) {
+    return (
+      <div className="flex items-center gap-1.5 border-t border-white/10 px-2.5 py-1 text-[11px] text-white/45">
+        <KeyRound className="h-3 w-3 shrink-0" />
+        <span className="min-w-0 flex-1 truncate" title={settings.ownKey.baseUrl}>
+          {t("Your own key: {model} at {host}", { model: settings.ownKey.model, host: hostOf(settings.ownKey.baseUrl) })}
+        </span>
+        <button type="button" className="font-medium text-sky-300 hover:text-sky-200" onClick={() => setOwnKeyForm(true)}>
+          {t("Change")}
+        </button>
+        <button type="button" className="font-medium text-white/55 hover:text-white" onClick={() => void api.invoke("ownkey:clear").catch(() => {})}>
+          {t("Stop using")}
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="flex items-center gap-2 border-t border-white/10 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] text-cyan-50">
+      <span className="min-w-0 flex-1">{t("Connect an API provider to enable AI answers.")}</span>
+      <button type="button" className="font-medium text-cyan-200 hover:text-white" onClick={() => setOwnKeyForm(true)}>{t("Add provider")}</button>
+    </div>
+  )
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+/** IPC rejections arrive as "Error invoking remote method '…': Error: <message>". */
+function invokeError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  return message.replace(/^Error invoking remote method '[^']+': (Error: )?/, "")
+}
+
+/**
+ * Answers from your own OpenAI-compatible endpoint instead of Meetingly's server: no account, no limits.
+ * The model list loads from the endpoint when it offers one; Save checks everything with one tiny request.
+ */
+function OwnKeyForm({ current, onClose }: { current: OwnKeyView | null; onClose: () => void }) {
+  const [baseUrl, setBaseUrl] = useState<string>(current?.baseUrl ?? OWN_KEY_PRESETS[0].baseUrl)
+  const [key, setKey] = useState("")
+  const [model, setModel] = useState(current?.model ?? "")
+  const [models, setModels] = useState<string[]>([])
+  const [modelsNote, setModelsNote] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const keepsSavedKey = Boolean(current?.hasKey && current.baseUrl === baseUrl.trim().replace(/\/+$/, ""))
+
+  const loadModels = async (url = baseUrl, apiKey = key) => {
+    if (!/^https?:\/\/\S+/i.test(url.trim())) return
+    setModelsNote(null)
+    try {
+      const list = await api.invoke("ownkey:models", { baseUrl: url, key: apiKey })
+      setModels(list)
+      setModelsNote(list.length ? null : t("This endpoint lists no models: type the model name."))
+    } catch {
+      setModels([])
+      setModelsNote(t("Couldn't load the model list: type the model name."))
+    }
+  }
+  useEffect(() => {
+    if (current) void loadModels()
+  }, [])
+
+  const save = async () => {
+    setSaving(true)
+    setError(null)
+    try {
+      await api.invoke("ownkey:save", { baseUrl, key, model })
+      onClose()
+    } catch (err) {
+      setError(invokeError(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const field = "h-6 min-w-0 rounded border border-white/[0.12] bg-white/5 px-2 text-[11.5px] text-white placeholder:text-white/30 focus:border-white/35 focus:outline-none"
+  return (
+    <form
+      className="border-t border-white/10 bg-white/[0.03] px-2.5 py-2 text-[11.5px] text-white/70"
+      onSubmit={(e) => {
+        e.preventDefault()
+        void save()
+      }}
+    >
+      <div className="mb-1.5 flex items-center gap-1.5">
+        <KeyRound className="h-3 w-3 text-white/50" />
+        <span className="font-medium text-white/90">{t("Use your own API key")}</span>
+        <span className="ml-auto flex gap-1">
+          {OWN_KEY_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              className={cn("rounded px-1.5 py-0.5 text-[10.5px]", baseUrl === p.baseUrl ? "bg-white/15 text-white" : "text-white/50 hover:bg-white/10 hover:text-white")}
+              onClick={() => {
+                setBaseUrl(p.baseUrl)
+                setModels([])
+                void loadModels(p.baseUrl)
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </span>
+      </div>
+      <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1">
+        <label htmlFor="own-url" className="text-white/50">{t("API address")}</label>
+        <input id="own-url" className={field} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} onBlur={() => void loadModels()} spellCheck={false} />
+        <label htmlFor="own-key" className="text-white/50">{t("API key")}</label>
+        <input
+          id="own-key"
+          type="password"
+          className={field}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          onBlur={() => void loadModels()}
+          placeholder={keepsSavedKey ? t("Saved. Leave empty to keep it.") : t("Not needed for Ollama")}
+          autoComplete="off"
+        />
+        <label htmlFor="own-model" className="text-white/50">{t("Model")}</label>
+        <input id="own-model" className={field} value={model} onChange={(e) => setModel(e.target.value)} list="own-models" placeholder={t("Pick or type a model")} spellCheck={false} />
+        <datalist id="own-models">
+          {models.map((m) => (
+            <option key={m} value={m} />
+          ))}
+        </datalist>
+      </div>
+      {modelsNote && <p className="mt-1 text-[11px] text-white/40">{modelsNote}</p>}
+      {error && <p className="selectable mt-1 text-[11px] text-rose-300">{error}</p>}
+      <div className="mt-1.5 flex items-center gap-1">
+        <span className="min-w-0 flex-1 text-[10.5px] leading-snug text-white/35">{t("Answers go straight to this provider. The key stays on this computer.")}</span>
+        <Button variant="ghost" size="sm" className="h-6 px-2 text-[11px]" onClick={onClose}>
+          {t("Cancel")}
+        </Button>
+        <Button type="submit" variant="primary" size="sm" className="h-6 px-2.5 text-[11px]" disabled={saving || !model.trim() || !baseUrl.trim()}>
+          {saving ? t("Checking…") : t("Save")}
+        </Button>
+      </div>
+    </form>
+  )
+}
+
+/** Answer bubbles: deep navy so they stand apart from everything else; what was heard is a quiet line above. */
+const ANSWER = "rounded-lg bg-[#132238] px-3 py-2 ring-1 ring-inset ring-sky-300/10"
+
+function Message({ message }: { message: ChatMessage }) {
+  const [copied, setCopied] = useState(false)
+  if (message.role === "user") {
+    if (message.kind === "auto") {
+      return (
+        <p className="selectable px-1 pt-1 text-[11.5px] leading-snug text-white/55">
+          <span className="mr-1.5 text-[10.5px] font-medium text-white/35">{t("Heard")}</span>
+          {message.text}
+        </p>
+      )
+    }
+    return <p className="selectable ml-10 rounded-lg bg-white/[0.08] px-3 py-1.5 text-[12.5px] text-white/90">{message.text}</p>
+  }
+  const copy = async () => {
+    if (await copyText(markdownToPlain(message.text))) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    }
+  }
+  return (
+    <div className={cn("group relative", message.kind === "error" ? "rounded-lg bg-rose-500/15 px-3 py-2 text-rose-200" : ANSWER)}>
+      {message.kind === "screenshot" && <div className="mb-0.5 flex items-center gap-1 text-[10.5px] text-sky-200/50"><Camera className="h-3 w-3" /> {t("Screen")}</div>}
+      {message.kind === "error" ? <p className="selectable text-[12.5px]">{message.text}</p> : <Markdown text={message.text} />}
+      {message.kind !== "error" && (
+        <button
+          type="button"
+          onClick={copy}
+          title={t("Copy")}
+          className="absolute right-1 top-1 rounded p-1 text-white/40 opacity-0 transition-opacity hover:bg-white/10 hover:text-white group-hover:opacity-100"
+        >
+          {copied ? <Check className="h-3 w-3 text-emerald-300" /> : <Copy className="h-3 w-3" />}
+        </button>
+      )}
+    </div>
+  )
+}
+
+interface Turn {
+  side: "you" | "them" | "other"
+  label: string
+  texts: string[]
+}
+
+/** Speaker labels stay English as data (the model and saved meetings read them); translate them on screen. */
+function speakerText(label: string): string {
+  const numbered = label.match(/^Speaker (\d+)$/)
+  return numbered ? t("Speaker {n}", { n: numbered[1] }) : t(label)
+}
+
+/** Consecutive lines from the same side become one turn, like a chat. */
+function toTurns(lines: TranscriptLine[]): Turn[] {
+  const turns: Turn[] = []
+  for (const l of lines) {
+    const side = l.channel ?? "other"
+    const label = segmentLabel(l) || ""
+    const last = turns[turns.length - 1]
+    if (last && last.side === side && last.label === label) last.texts.push(l.text)
+    else turns.push({ side, label, texts: [l.text] })
+  }
+  return turns
+}
+
+function Transcript(props: {
+  status: string
+  connected: boolean
+  source: AudioSource
+  notice: string | null
+  lines: TranscriptLine[]
+  interim: Interim
+  onSource: (s: AudioSource) => void
+  deviceId: string
+  onDevice: (id: string) => void
+  /** Suggested questions while listening; off sends nothing to the AI for them. */
+  suggestions: boolean
+  onSuggestions: (on: boolean) => void
+}) {
+  const { status, connected, source, notice, lines, interim, onSource, deviceId, onDevice, suggestions, onSuggestions } = props
+  const ref = useRef<HTMLDivElement>(null)
+  const [copied, setCopied] = useState(false)
+  const live = [interim.them, interim.you, interim.other].filter(Boolean).join(" ")
+  useEffect(() => {
+    ref.current?.scrollTo({ top: ref.current.scrollHeight })
+  }, [lines.length, live])
+
+  const turns = toTurns(lines)
+  const text = turns.map((turn) => (turn.label ? `${speakerText(turn.label)}: ${turn.texts.join(" ")}` : turn.texts.join(" "))).join("\n")
+  const copy = async () => {
+    if (await copyText(text)) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    }
+  }
+
+  return (
+    <>
+      {notice && <div className="mx-2 mt-1.5 rounded-md border border-amber-400/25 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200">{notice}</div>}
+      {status === "idle" ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-4 text-center">
+          <p className="text-[11.5px] text-white/50">{t("The live transcript shows here while listening.")}</p>
+          <Button variant="primary" size="sm" onClick={() => void api.invoke("session:start").catch(() => {})}>
+            <Mic className="h-3.5 w-3.5" /> {t("Start listening")}
+          </Button>
+        </div>
+      ) : (
+        <div ref={ref} className="scroll selectable min-h-0 flex-1 space-y-2 px-2.5 py-2 text-[12.5px] leading-relaxed">
+          {turns.map((turn, i) => <TurnView key={i} turn={turn} />)}
+          {(["them", "other", "you"] as const).map((side) => {
+            const words = interim[side]
+            return words ? <TurnView key={`live-${side}`} turn={{ side, label: "", texts: [words] }} live /> : null
+          })}
+          {!text && !live && <p className="text-white/40">{connected ? t("Listening…") : t("Starting…")}</p>}
+        </div>
+      )}
+      <div className="flex items-center gap-1 border-t border-white/10 p-1.5">
+        <Select value={source} onChange={(e) => onSource(e.target.value as AudioSource)} className="h-7 min-w-0 flex-1 bg-black/30 px-2 py-0 text-[11px]" title={t("What to transcribe")}>
+          {(Object.keys(AUDIO_SOURCE_LABELS) as AudioSource[]).map((s) => <option key={s} value={s}>{t(AUDIO_SOURCE_LABELS[s])}</option>)}
+        </Select>
+        {source !== "system" && <MicPicker value={deviceId} onChange={onDevice} />}
+        <label
+          className="flex shrink-0 cursor-pointer items-center gap-1.5 px-1.5 text-[11px] text-white/55"
+          title={t("Suggested questions while listening. Off: just the transcript, nothing is sent to the AI for suggestions.")}
+        >
+          {t("Suggestions")}
+          <Toggle size="sm" checked={suggestions} onChange={onSuggestions} label={t("Suggested questions")} />
+        </label>
+        <Button variant="ghost" size="icon-sm" onClick={copy} disabled={!text} title={t("Copy transcript")}>
+          {copied ? <Check className="h-3.5 w-3.5 text-emerald-300" /> : <Copy className="h-3.5 w-3.5" />}
+        </Button>
+      </div>
+    </>
+  )
+}
+
+const PICK = "h-7 w-[190px] shrink-0 bg-black/30 px-2 py-0 text-[11.5px]"
+
+/**
+ * What changes from one meeting to the next, without the browser and without an account. Instructions, shortcuts,
+ * the plan and past meetings stay on the web dashboard. Changes here sync to the account like changes made there.
+ */
+function SettingsTab({ settings, update, plan, autoAllowed }: {
+  settings: SettingsView
+  update: (patch: Partial<SettingsView>) => Promise<void>
+  plan: PlanState
+  autoAllowed: boolean
+}) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="scroll min-h-0 flex-1 divide-y divide-white/[0.06] px-2.5">
+        <SettingRow label={t("Meeting language")} hint={t("The language spoken in the meeting.")}>
+          <Select value={settings.audioLanguage} onChange={(e) => void update({ audioLanguage: e.target.value as LanguageCode })} className={PICK} aria-label={t("Meeting language")}>
+            {LANGUAGES.map((l) => <option key={l.code} value={l.code}>{l.name}</option>)}
+          </Select>
+        </SettingRow>
+        <SettingRow label={t("Answer language")} hint={t("For answers and the meeting report.")}>
+          <Select value={settings.outputLanguage} onChange={(e) => void update({ outputLanguage: e.target.value as LanguageCode })} className={PICK} aria-label={t("Answer language")}>
+            {LANGUAGES.map((l) => <option key={l.code} value={l.code}>{l.name}</option>)}
+          </Select>
+        </SettingRow>
+        <SettingRow label={t("Audio source")} hint={t("System audio is the call; the microphone is you.")}>
+          <Select value={settings.audioSource} onChange={(e) => void update({ audioSource: e.target.value as AudioSource })} className={PICK} aria-label={t("Audio source")}>
+            {(Object.keys(AUDIO_SOURCE_LABELS) as AudioSource[]).map((s) => <option key={s} value={s}>{t(AUDIO_SOURCE_LABELS[s])}</option>)}
+          </Select>
+        </SettingRow>
+        {settings.audioSource !== "system" && (
+          <SettingRow label={t("Microphone")}>
+            <MicPicker value={settings.audioDeviceId} onChange={(id) => void update({ audioDeviceId: id })} className={PICK} />
+          </SettingRow>
+        )}
+        <SettingRow label={t("Auto-answer")} hint={t("Answers questions heard in the meeting by itself.")}>
+          {autoAllowed ? (
+            <Select value={settings.autoAnswer} onChange={(e) => void update({ autoAnswer: e.target.value as AutoAnswerMode })} className={PICK} aria-label={t("Auto-answer")}>
+              {(Object.keys(AUTO_ANSWER_LABELS) as AutoAnswerMode[]).map((m) => <option key={m} value={m}>{t(AUTO_ANSWER_LABELS[m])}</option>)}
+            </Select>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void api.invoke("panel:show", "answers")}
+              title={t("Configure an API provider to enable automatic answers.")}
+              className="flex h-7 w-[190px] shrink-0 items-center gap-1.5 rounded-md border border-white/15 px-2 text-left text-[11.5px] text-white/55 transition-colors hover:bg-white/10 hover:text-white"
+            >
+              <span className="text-cyan-300">{t("Add provider")}</span>
+            </button>
+          )}
+        </SettingRow>
+        <SettingRow label={t("Answer length")}>
+          <Select value={settings.answerLength} onChange={(e) => void update({ answerLength: e.target.value as AnswerLength })} className={PICK} aria-label={t("Answer length")}>
+            {(Object.keys(ANSWER_LENGTHS) as AnswerLength[]).map((l) => <option key={l} value={l}>{t(ANSWER_LENGTHS[l].label)}</option>)}
+          </Select>
+        </SettingRow>
+        <SettingRow label={t("Suggested questions")} hint={t("Off: just the transcript, nothing is sent to the AI for them.")}>
+          <Toggle checked={settings.suggestions} onChange={(on) => void update({ suggestions: on })} label={t("Suggested questions")} />
+        </SettingRow>
+        <SettingRow label={t("Keep meetings on this computer")} hint={t("No meeting report and no sync to your account. Answers and suggested questions still use the AI.")}>
+          <Toggle checked={settings.keepMeetingsLocal} onChange={(on) => void update({ keepMeetingsLocal: on })} label={t("Keep meetings on this computer")} />
+        </SettingRow>
+        <SettingRow label={t("Stealth mode")} hint={t("Hidden from screen sharing, recordings and screenshots.")}>
+          <Toggle checked={settings.stealth} onChange={(on) => void update({ stealth: on })} label={t("Stealth mode")} />
+        </SettingRow>
+      </div>
+      <div className="flex items-center gap-1 border-t border-white/10 p-1.5">
+        <Button variant="ghost" size="sm" className="h-6 px-2 text-[11px]" onClick={() => void api.invoke("transcripts:reveal")} title={t("Every session is saved as a text file in Documents/Meetingly.")}>
+          <FolderOpen className="h-3 w-3" /> {t("Saved transcripts")}
+        </Button>
+        <span className="min-w-0 flex-1 truncate text-center text-[10.5px] text-white/30" title={`Meetingly ${settings.version}`}>v{settings.version}</span>
+        <Button variant="ghost" size="sm" className="h-6 px-2 text-[11px]" onClick={() => void api.invoke("cloud:open-web")} title={t("Instructions, shortcuts, plan and past meetings")}>
+          {t("More settings on the web")} <ExternalLink className="h-3 w-3" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function SettingRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-[40px] items-center gap-3 py-1.5">
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-[12px] font-medium text-white/90" title={label}>{label}</div>
+        {hint && <p className="line-clamp-2 text-[10.5px] leading-snug text-white/40">{hint}</p>}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+/** The microphone to listen with; the list is read again whenever it is opened, so new devices show up. */
+function MicPicker({ value, onChange, className }: { value: string; onChange: (id: string) => void; className?: string }) {
+  const [devices, setDevices] = useState<AudioInputDevice[]>([])
+  const refresh = () => void listAudioInputs().then(setDevices).catch(() => setDevices([]))
+  useEffect(refresh, [])
+  return (
+    <Select value={value} onChange={(e) => onChange(e.target.value)} onFocus={refresh} className={className ?? "h-7 min-w-0 flex-1 bg-black/30 px-2 py-0 text-[11px]"} title={t("Microphone")}>
+      <option value="">{t("Default microphone")}</option>
+      {devices.map((d) => (
+        <option key={d.id} value={d.id}>
+          {d.isMonitor ? t("{label} (system audio)", { label: d.label }) : d.label}
+        </option>
+      ))}
+      {value && !devices.some((d) => d.id === value) && <option value={value}>{t("Previously selected device (unplugged)")}</option>}
+    </Select>
+  )
+}
+
+/** The other side on the left, you on the right; unlabelled (cloud) speakers on the left with their label. */
+function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
+  const mine = turn.side === "you"
+  return (
+    <div className={cn("flex flex-col", mine ? "items-end" : "items-start")}>
+      {turn.label && <span className="mb-0.5 px-1 text-[10.5px] font-medium text-white/40">{speakerText(turn.label)}</span>}
+      <div
+        className={cn(
+          "max-w-[88%] space-y-1 rounded-lg px-2.5 py-1.5",
+          mine ? "rounded-br-sm bg-sky-500/15 text-sky-50/90" : "rounded-bl-sm bg-white/[0.06] text-white/90",
+          live && "italic opacity-70"
+        )}
+      >
+        {turn.texts.map((line, i) => <p key={i}>{line}</p>)}
+      </div>
+    </div>
+  )
+}
+
+/** Microphone and system-audio meters; dimmed when that source is not captured. */
+function Levels({ levels }: { levels: AudioLevels }) {
+  return (
+    <div className="mr-1 flex items-center gap-2">
+      <Meter icon={<Mic className="h-3 w-3" />} level={levels.microphone} title={t("Microphone")} />
+      <Meter icon={<Volume2 className="h-3 w-3" />} level={levels.system} title={t("System audio")} />
+    </div>
+  )
+}
+
+function Meter({ icon, level, title }: { icon: React.ReactNode; level: number | null; title: string }) {
+  const active = level !== null
+  const pct = Math.round((level ?? 0) * 100)
+  return (
+    <div className={cn("flex items-center gap-1", active ? "text-white/70" : "text-white/25")} title={active ? `${title}: ${pct}%` : t("{title}: not captured", { title })}>
+      {icon}
+      <div className="h-1 w-9 overflow-hidden rounded-full bg-white/10">
+        <div className={cn("h-full rounded-full transition-[width] duration-100", pct > 70 ? "bg-rose-400" : "bg-emerald-400")} style={{ width: `${active ? Math.max(pct, 2) : 0}%` }} />
+      </div>
+    </div>
+  )
+}

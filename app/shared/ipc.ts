@@ -1,0 +1,201 @@
+// Single source of truth for IPC channel names and their signatures.
+// The preload only forwards channels listed here; the renderer gets full typing.
+
+import type { CloudState } from "./cloud"
+import type {
+  ChatChunk,
+  ChatMessage,
+  Meeting,
+  ScreenshotResult,
+  SessionState,
+  OwnKeyInput,
+  Settings,
+  SettingsView,
+  PlanState,
+  SuggestionsState,
+  TranscriptEvent,
+  UpdateState,
+  Utterance,
+  WindowKind,
+  WindowsState,
+  PanelTab
+} from "./types"
+
+/** Renderer -> main request/response. */
+export interface InvokeMap {
+  "settings:get": () => SettingsView
+  "settings:update": (patch: Partial<Settings>) => SettingsView
+
+  "windows:state": () => WindowsState
+  "windows:show": (kind: WindowKind) => void
+  "windows:hide": (kind: WindowKind) => void
+  "windows:toggle": (kind: WindowKind) => boolean
+  "windows:toggle-all": () => void
+  /** Show the panel on a tab; toggle hides it when it is already showing that tab. */
+  "panel:show": (tab: PanelTab) => void
+  "panel:toggle": (tab: PanelTab) => void
+  /** The user switched tabs inside the panel. */
+  "panel:set-tab": (tab: PanelTab) => void
+  /** Resize the calling window to fit its content. */
+  "windows:fit": (size: { width: number; height: number }) => void
+  /** Dragging the panel's header moves the toolbar (the panel follows): offsets from where the drag started. */
+  "windows:drag": (step: { phase: "start" | "move" | "end"; dx: number; dy: number }) => void
+  /** Show the last saved transcript (.txt) in the file manager, or the transcripts folder when there is none. */
+  "transcripts:reveal": () => void
+  "app:quit": () => void
+  /** Reveal the log file in the OS file manager. */
+  "app:open-logs": () => void
+  /** Write a renderer diagnostic into the app log. */
+  "app:log": (entry: { level: "debug" | "info" | "warn" | "error"; scope: string; message: string; data?: unknown }) => void
+
+  "session:state": () => SessionState
+  "session:start": () => SessionState
+  "session:pause": () => SessionState
+  "session:resume": () => SessionState
+  /** Stops transcription, saves the meeting, returns it (null when nothing was said). */
+  "session:finish": () => Meeting | null
+  "session:cancel": () => SessionState
+  "session:audio": (pcm16: ArrayBuffer) => void
+  "session:transcript": () => string
+  /** The most recent finished utterance, if any. */
+  "session:last-utterance": () => Utterance | null
+
+  "chat:history": () => ChatMessage[]
+  /** Streams the reply through chat:chunk / chat:message events. */
+  "chat:send": (text: string) => void
+  /** Answer the last thing heard in the meeting right now, whatever the hands-free setting. */
+  "chat:answer-last": () => boolean
+  "chat:clear": () => void
+  "chat:screenshot": (prompt?: string) => ScreenshotResult
+
+  "suggestions:state": () => SuggestionsState
+  /** Regenerate the suggestions from the conversation now. */
+  "suggestions:refresh": () => void
+  /** Ask a suggestion (its id) or a quick action (QuickActionId); the answer streams into chat. */
+  "suggestions:use": (id: string) => void
+
+  "cloud:state": () => CloudState
+  /** Starts device linking: returns the code and opens the browser. */
+  "cloud:link-start": () => CloudState
+  "cloud:link-cancel": () => CloudState
+  "cloud:unlink": () => CloudState
+  /** Opens the web dashboard signed in as this device. */
+  "cloud:open-web": (page?: "billing" | "meetings" | "guide") => void
+  "cloud:sync-now": () => CloudState
+
+  "plan:state": () => PlanState
+  "plan:refresh": () => PlanState
+  /** Open the account's plan page in the browser (signed in when the account is linked). */
+  "plan:upgrade": () => void
+
+  /** The models an OpenAI-compatible endpoint offers (empty key: the saved one, or none). */
+  "ownkey:models": (input: OwnKeyInput) => string[]
+  /** Check the endpoint, key and model with one tiny request, then use them for every AI request. */
+  "ownkey:save": (input: OwnKeyInput) => SettingsView
+  "ownkey:clear": () => SettingsView
+  /** True once after the tray asked for the own-key form (the panel takes it when it loads). */
+  "ownkey:pending": () => boolean
+
+}
+
+/** Main -> renderer push events. */
+export interface EventMap {
+  "session:state": SessionState
+  "session:transcript": TranscriptEvent
+  "session:utterance": Utterance
+  "windows:state": WindowsState
+  "panel:tab": PanelTab
+  "settings:changed": SettingsView
+  "chat:message": ChatMessage
+  "chat:chunk": ChatChunk
+  "chat:busy": boolean
+  "chat:cleared": undefined
+  "suggestions:state": SuggestionsState
+  "meetings:changed": undefined
+  "cloud:state": CloudState
+  "plan:state": PlanState
+  "update:state": UpdateState
+  /** The tray asked for the own-key form. */
+  "ownkey:open": undefined
+}
+
+export type InvokeChannel = keyof InvokeMap
+export type EventChannel = keyof EventMap
+
+export const INVOKE_CHANNELS: InvokeChannel[] = [
+  "settings:get",
+  "settings:update",
+  "windows:state",
+  "windows:show",
+  "windows:hide",
+  "windows:toggle",
+  "windows:toggle-all",
+  "panel:show",
+  "panel:toggle",
+  "panel:set-tab",
+  "windows:fit",
+  "windows:drag",
+  "transcripts:reveal",
+  "app:quit",
+  "app:open-logs",
+  "app:log",
+  "session:state",
+  "session:start",
+  "session:pause",
+  "session:resume",
+  "session:finish",
+  "session:cancel",
+  "session:audio",
+  "session:transcript",
+  "session:last-utterance",
+  "chat:history",
+  "chat:send",
+  "chat:answer-last",
+  "chat:clear",
+  "chat:screenshot",
+  "suggestions:state",
+  "suggestions:refresh",
+  "suggestions:use",
+  "cloud:state",
+  "cloud:link-start",
+  "cloud:link-cancel",
+  "cloud:unlink",
+  "cloud:open-web",
+  "cloud:sync-now",
+  "plan:state",
+  "plan:refresh",
+  "plan:upgrade",
+  "ownkey:models",
+  "ownkey:save",
+  "ownkey:clear",
+  "ownkey:pending"
+]
+
+export const EVENT_CHANNELS: EventChannel[] = [
+  "session:state",
+  "session:transcript",
+  "session:utterance",
+  "windows:state",
+  "panel:tab",
+  "settings:changed",
+  "chat:message",
+  "chat:chunk",
+  "chat:busy",
+  "chat:cleared",
+  "suggestions:state",
+  "meetings:changed",
+  "cloud:state",
+  "plan:state",
+  "update:state",
+  "ownkey:open"
+]
+
+/** Shape exposed on `window.api` by the preload script. */
+export interface RendererApi {
+  invoke<K extends InvokeChannel>(
+    channel: K,
+    ...args: Parameters<InvokeMap[K]>
+  ): Promise<Awaited<ReturnType<InvokeMap[K]>>>
+  on<K extends EventChannel>(channel: K, listener: (payload: EventMap[K]) => void): () => void
+  platform: string
+}
